@@ -1,0 +1,15 @@
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+*.pkl
+*.csv
+*.npy
+*xlsx
+*.model
+*.zip
+*.Rds
+*.rds
+*.pdf
+*.sqlite
+*.tar.gz

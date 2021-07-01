@@ -1,0 +1,31 @@
+---
+title: "Tumor Microenvironment Starter"
+author: "Joel Eliason"
+date: "6/28/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(TMExplorer)
+```
+
+This notebook will host my research into single cell RNA-seq for tumor microenvironment analysis.
+
+```{r}
+queryTME(metadata_only = TRUE)
+```
+
+```{r}
+res = queryTME(pmid = "29988129")
+
+saveRDS(res, "tme/GSE116256.rds")
+
+fibro = readRDS("tme/Fibro.Cellview.Rds")
+
+con <- unz("tme/E-MTAB-6149.processed.1.zip", filename = "Fibro.Cellview.Rds")
+con2 <- gzcon(con)
+mat2 <- readRDS(con2)
+close(con2)
+```
+

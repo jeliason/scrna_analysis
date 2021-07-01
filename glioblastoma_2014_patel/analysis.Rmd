@@ -1,0 +1,345 @@
+---
+title: "Glioblastoma scRNA-seq analysis (Patel et al. 2014)"
+author: "Joel Eliason"
+date: "4/30/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(SingleCellExperiment)
+```
+
+In this notebook, I attempt a fairly straightforward imitation of the single-cell RNA seq analysis outlined by the OSCA tutorial, but applied to a different publicly available dataset.
+
+I also start a closer investigation of various clustering methods using in single-cell RNA seq analysis.
+
+```{r}
+d = read.table('/media/joeleliason/Data/glioblastoma_2014_patel/SCP10/expression/Glioblastoma_expressed_genes.txt', 
+               header = T, row.names = 1)
+
+spike_counts = d[grep("ERCC",rownames(d)),]
+
+d = d[-grep("ERCC",rownames(d)),]
+
+sce = SingleCellExperiment(assays = list(logcounts = as.matrix(d),
+                                         counts = exp(as.matrix(d))))
+
+spike_se = SummarizedExperiment(assays = list(
+                                  counts = exp(as.matrix(spike_counts))))
+
+altExp(sce, "spike") = spike_se
+sce
+
+
+```
+
+Since our data is already presumably QC'ed and normalized (we know it is log-transformed), we can move right into modeling the variance and then extracting the top 10% of highly variable genes:
+
+## Variance modeling and highly-variable genes
+
+```{r}
+library(scran)
+
+geneVar <- modelGeneVar(sce)
+
+# Visualizing the fit:
+fit <- metadata(geneVar)
+plot(fit$mean, fit$var, xlab="Mean of log-expression",
+    ylab="Variance of log-expression")
+curve(fit$trend(x), col="dodgerblue", add=TRUE, lwd=2)
+```
+
+```{r}
+# geneCV2 = modelGeneCV2(sce)
+# 
+# 
+# varSpike = modelGeneCV2WithSpikes(sce, "spike")
+# varPois = modelGeneVarByPoisson(sce)
+
+hvg = getTopHVGs(geneVar, prop = 0.1)
+hvg
+```
+
+This reduction in number of genes, plus our steps in dimensionality reduction (next) make it much more possible to perform computationally demanding steps like clustering or other cell comparisons.
+
+## Dimensionality reduction
+
+```{r}
+library(scater)
+
+set.seed(1234)
+sce <- runPCA(sce, subset_row=hvg)
+
+percent.var <- attr(reducedDim(sce), "percentVar")
+chosen.elbow <- PCAtools::findElbowPoint(percent.var)
+
+```
+
+Scree plot with elbow:
+
+```{r}
+plot(percent.var, log="y", xlab="PC", ylab="Variance explained (%)")
+abline(v=chosen.elbow, col="red")
+```
+
+UMAP vs PCA on two dimensions:
+
+```{r}
+reducedDimNames(sce)
+reducedDim(sce, "PCA") <- reducedDim(sce)[,1:chosen.elbow]
+
+plotReducedDim(sce, dimred = "PCA")
+sce <- runUMAP(sce, dimred = 'PCA', external_neighbors=TRUE)
+
+plotReducedDim(sce, dimred = "UMAP")
+```
+
+## Clustering
+
+```{r}
+g <- buildSNNGraph(sce, use.dimred = 'PCA')
+colLabels(sce) <- factor(igraph::cluster_louvain(g)$membership)
+# cluster membership in colLabels
+
+plotUMAP(sce, colour_by="label")
+```
+
+## Marker gene detection
+
+```{r}
+# checks differential expression between each pair of clusters. Can customize with statistical test, direction and how to combine p-values.
+markers = findMarkers(sce)
+
+cluster = '1'
+interesting = markers[[cluster]]
+
+best.set = interesting[interesting$Top <= 7,]
+logFCs = getMarkerEffects(best.set)
+
+library(pheatmap)
+pheatmap(logFCs)
+```
+
+```{r}
+logFCs
+```
+
+### Cell type annotation
+
+```{r cache=T}
+library(celldex)
+
+ref <- BlueprintEncodeData()
+ref
+```
+Here we assign cell types based on similarity in gene expression levels to a previously annotated reference set.
+
+```{r}
+library(SingleR)
+pred <- SingleR(test=sce, ref=ref, labels=ref$label.fine)
+# label.fine vs label.main
+table(pred$labels)
+```
+
+```{r}
+plotScoreHeatmap(pred)
+```
+
+We can visualize the likelihood of each label per cluster:
+
+```{r}
+tab <- table(Assigned=pred$pruned.labels, Cluster=colLabels(sce))
+
+# Adding a pseudo-count of 10 to avoid strong color jumps with just 1 cell.
+pheatmap(log2(tab+10), color=colorRampPalette(c("white", "blue"))(101))
+```
+
+Can also assign cluster labels based on marker genes:
+
+```{r}
+chosen <- "2"
+cur.markers <- markers[[chosen]]
+is.de <- cur.markers$FDR <= 0.05 
+summary(is.de)
+
+# goana() requires Entrez IDs, some of which map to multiple
+# symbols - hence the unique() in the call below.
+
+# goana uses a hypergeometric test to check overrepresentation of certain markers,
+# in comparison with biological processes in gene ontology
+
+library(org.Hs.eg.db)
+entrez.ids <- mapIds(org.Hs.eg.db, keys=rownames(cur.markers), 
+    column="ENTREZID", keytype="SYMBOL")
+
+library(limma)
+go.out <- goana(unique(entrez.ids[is.de]), species="Hs", 
+    universe=unique(entrez.ids))
+
+# Only keeping biological process terms that are not overly general, ie, biological processes
+# that don't have too many members.
+go.out <- go.out[order(go.out$P.DE),]
+go.useful <- go.out[go.out$Ont=="BP" & go.out$N <= 200,]
+head(go.useful, 20)
+```
+
+Can then see the genes involved in each of these likely GO terms. We demonstrate with GO:0021782, related to glial cell development:
+
+```{r}
+# Extract symbols for each GO term; done once.
+tab <- select(org.Hs.eg.db, keytype="SYMBOL", 
+    keys=rownames(sce), columns="GOALL")
+by.go <- split(tab[,1], tab[,2])
+
+# Identify genes associated with an interesting term.
+glial <- unique(by.go[["GO:0021782"]])
+head(cur.markers[rownames(cur.markers) %in% glial,1:4], 10)
+```
+
+Since EGFR and CLU are both differentially expressed and involved in glial cell development, we can plot their expression in each cluster:
+
+```{r}
+library(scater)
+plotExpression(sce, features=c("EGFR", "CLU"), 
+    x="label", colour_by="label")
+```
+
+
+
+## Clustering diagnostics
+
+First diagnostic is approximate silhouette, which gives us an idea of how well-separated each cluster is. Large positive silhouette widths indicate well-separation and cohesion. Smaller widths can arise from the presence of internal subclusters, which inflates the within-cluster distance; or overclustering, where cells at the boundary of a partition are closer to the neighboring cluster than their own cluster. We can see that cluster 1 is not very well separated or cohesive, so we will have to drill into that with more diagnostics.
+
+```{r}
+library(bluster)
+
+plotApproxSilhouette = function(sce, clust) {
+
+  # Performing the calculations on the PC coordinates, like before.
+  sil.approx <- approxSilhouette(reducedDim(sce, "PCA"), clusters=clust)
+  
+  sil.data <- as.data.frame(sil.approx)
+  sil.data$closest <- factor(ifelse(sil.data$width > 0, clust, sil.data$other))
+  sil.data$cluster <- factor(clust)
+  
+  ggplot(sil.data, aes(x=cluster, y=width, colour=closest)) + 
+    ggbeeswarm::geom_quasirandom(method="smiley")
+}
+
+clust <- clusterRows(reducedDim(sce, "PCA"), NNGraphParam())
+plotApproxSilhouette(sce, clust)
+```
+
+We can also look at clustering purity, which is the proportion of neighboring cells (in expression space) that are in the same cluster. Again, cluster 1 shows a decent amount of intermingling with other clusters.
+
+```{r}
+plotPurity = function(sce, clust) {
+  pure <- neighborPurity(reducedDim(sce, "PCA"), clusters=clust)
+
+  pure.data <- as.data.frame(pure)
+  pure.data$maximum <- factor(pure.data$maximum)
+  pure.data$cluster <- factor(clust)
+  
+  ggplot(pure.data, aes(x=cluster, y=purity, colour=maximum)) +
+    ggbeeswarm::geom_quasirandom(method="smiley")
+}
+
+plotPurity(sce, clust)
+```
+
+"However, regardless of the chosen diagnostic method, it is worth keeping in mind that poor separation is not synonymous with poor quality. In fact, poorly separated clusters will often be observed in non-trivial analyses of scRNA-seq data where the aim is to characterize closely related subtypes or states. These diagnostics are best used to guide interpretation by highlighting clusters that require more investigation rather than to rule out poorly separated clusters altogether." - OSCA book
+
+Based on that, we will definitely need to do a closer examination of cluster 1.
+
+### Comparing clusterings
+
+We can also look at two-way tables of clustering overlap - e.g.,
+
+```{r}
+clust1 = clusterRows(reducedDim(sce, "PCA"), NNGraphParam(cluster.fun = 'walktrap'))
+clust2 = clusterRows(reducedDim(sce, "PCA"), NNGraphParam(cluster.fun = 'louvain'))
+
+
+tab <- table(Cluster1=clust1, Cluster2=clust2)
+tab <- tab/rowSums(tab)
+pheatmap(tab, cluster_cols=FALSE, cluster_rows=FALSE, display_numbers = T, main = paste0('Comparison of cluster 1 (rows) by cluster 2 (columns)'))
+```
+
+Interestingly, we can see that the Louvain clustering separated the cluster 1 from the Walktrap algorithm into two separate clusters. Let's take a look at the approximate silhouette widths and purity from the Louvain clustering.
+
+```{r}
+plotApproxSilhouette(sce, clust2)
+plotPurity(sce, clust2)
+```
+s
+We can also compare clusterings that are nested or differ in resolution.
+
+```{r}
+library(clustree)
+ks = c(50,10,5)
+
+clustreeGraphs = function(ks, sce, cluster.fun) {
+  clusts = sapply(ks, function(k) {
+    list(clusterRows(reducedDim(sce, "PCA"), NNGraphParam(cluster.fun = cluster.fun, k = k)))
+  })
+  
+  combined <- do.call(cbind, clusts)
+  colnames(combined) = sapply(ks, function(k) {
+    paste0('k.',k)
+  })
+  clustree(combined, prefix="k.", edge_arrow=FALSE)
+}
+
+clustreeGraphs(ks, sce, cluster.fun = 'louvain')
+
+```
+
+Cluster stability can also be measured:
+
+```{r}
+myClusterFUN <- function(x) {
+    g <- bluster::makeSNNGraph(x, type="jaccard")
+    igraph::cluster_louvain(g)$membership
+}
+
+pcs <- reducedDim(sce, "PCA")
+originals <- myClusterFUN(pcs)
+table(originals) # inspecting the cluster sizes.
+
+set.seed(0010010100)
+ratios <- bootstrapStability(pcs, FUN=myClusterFUN, clusters=originals)
+pheatmap(ratios, cluster_row=FALSE, cluster_col=FALSE,
+    color=viridis::magma(100), breaks=seq(-1, 1, length.out=101), display_numbers = T,
+    main = "ARI-derived ratios per cluster pair, averaged across bootstrap samples")
+```
+
+High ratios indicate that the clustering in the bootstrap replicates are highly consistent with that of the original dataset. More specifically, high ratios on the diagonal indicate that cells in the same original cluster are still together in the bootstrap replicates, while high ratios off the diagonal indicate that cells in the corresponding cluster pair are still separated.
+
+It is possible for a poor separation to be highly stable, so highly stable cluster may not necessarily represent some distinct subpopulation.
+
+## Subclustering
+
+Let's examine cluster 1 from our original clustering above (the one with low silhouette width):
+
+```{r}
+set.seed(1000010)
+subcluster.out <- quickSubCluster(sce, groups=clust,
+    prepFUN=function(x) { # Preparing the subsetted SCE for clustering.
+        dec <- modelGeneVar(x)
+        input <- denoisePCA(x, technical=dec,
+            subset.row=getTopHVGs(dec),
+            BSPARAM=BiocSingular::IrlbaParam())
+    },
+    clusterFUN=function(x) { # Performing the subclustering in the subset.
+        g <- buildSNNGraph(x, use.dimred="PCA", k=20) # don't want too fine-grained subclusters
+        igraph::cluster_walktrap(g)$membership
+    }
+)
+
+# One SingleCellExperiment object per parent cluster:
+names(subcluster.out)
+
+table(subcluster.out[[1]]$subcluster)
+```
+

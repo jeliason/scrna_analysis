@@ -1,0 +1,498 @@
+---
+title: "Lung timecourse interpretability"
+author: "Joel Eliason"
+date: "6/18/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(R.matlab)
+library(SingleCellExperiment)
+library(scater)
+library(scran)
+library(scry)
+library(xgboost)
+library(iml)
+library(reticulate)
+```
+
+This notebook contains my work on interpretable ML for gene expression analysis. In particular, I use a publicly available longitudinal single-cell RNA seq dataset of lung cancer cells and train a boosted trees model to predict timepoint at which a cell was sampled, based on its gene expression values. I then examine the SHAP values (an interpretability framework for feature importance) from this model using TreeSHAP and attempt to discern whether or not SHAP values give us additional insight beyond what a typical differential expression analysis might give.
+
+```{r}
+# path = '/media/joeleliason/Data/lung_timecourse/SCP971/other/ltraw.mat'
+# 
+# r = readMat(path)
+# 
+# counts = r$rawCount
+# 
+# colnames(counts) = unlist(r$sampleID, recursive = FALSE)
+# rownames(counts) = unlist(r$geneSymbol, recursive = FALSE)
+# 
+# # counts = counts[,-grep('_4w_',colnames(counts))]
+# sce = SingleCellExperiment(assays = list(counts = counts))
+# 
+# sce$typeID = do.call(c, unlist(r$typeID, recursive=FALSE))
+# 
+# spl = strsplit(sce$typeID,'_')
+# weeks = sapply(spl, function(x) x[3])
+# sce$weeks = weeks
+# 
+# # sce$geneID = do.call(c, unlist(r$geneID, recursive=FALSE))
+# 
+# rm(r,counts,spl)
+# 
+# sce = devianceFeatureSelection(sce, assay="counts", sorted = TRUE, batch = as.factor(sce$typeID))
+# saveRDS(sce, "lung_timecourse/SCP971_sce.rds")
+
+sce = readRDS("lung_timecourse/SCP971_sce.rds")
+```
+
+We will need to perform some feature selection here - we currently have 52638 features (genes) in the sce, so we will need to take it to somewhere closer to 1000-2000. After this, we can perform cross-validated training using XGBoost, after which we can briefly evaluate performance and then get on to the interpretation (including using SHAP values and looking at interesting interactions).
+
+We'll be using the binomial deviance as our feature selection method, which has some better qualities to it than using (for example) the variance of that gene (after correcting for heteroscedasticity).
+
+
+We're going to do the top 500 (for easier calculation of SHAP values), even though it seems like a better cutoff may be 10000.
+
+```{r}
+sce = sce[1:500,]
+
+plot(rowData(sce)$binomial_deviance, type="l", xlab="ranked genes",
+     ylab="binomial deviance", main="Feature Selection with Deviance")
+abline(v=100, lty=2, col="red")
+```
+
+Now let's actually train an xgboost model on this data set.
+
+```{r}
+# X = t(assay(sce, "counts"))
+# 
+# y = factor(sce$weeks, levels = c("early","2w","12w","18w","20w","30w"))
+# 
+# levels(y)
+# y = as.numeric(y) - 1
+# 
+# 
+# 
+# params = list(max_depth=6, eta=0.05, objective = "multi:softmax", num_class = 6)
+# cv.m = xgb.cv(params = params, data = X, label = y, nrounds = 10, nfold = 5, verbose = 1)
+```
+
+These train/test losses look pretty normal to me, so I will go ahead and train on the full data:
+
+```{r}
+# ## 75% of the sample size
+# smp_size <- floor(0.8 * nrow(X))
+# 
+# ## set the seed to make your partition reproducible
+# set.seed(123)
+# train_ind <- sample(seq_len(nrow(X)), size = smp_size)
+# 
+# trainX <- X[train_ind, ]
+# valX <- X[-train_ind, ]
+# 
+# trainY = y[train_ind]
+# valY = y[-train_ind]
+# 
+# train = xgb.DMatrix(trainX, label=trainY)
+# val = xgb.DMatrix(valX, label=valY)
+# 
+# watchlist = list(train=train,eval=val)
+# 
+# m = xgb.train(params, train, nrounds = 500, early_stopping_rounds = 5, watchlist=watchlist)
+# 
+# xgb.save(m, "lt_model.model")
+# 
+# write.csv(as.data.frame(as.matrix(X)), "lt_X_500.csv")
+# 
+# write.csv(y, "lt_y.csv")
+
+
+```
+
+
+### Interpretable ML using SHAP values with XGBoost model
+
+
+```{r}
+use_condaenv("bioinfo")
+
+source_python("read_npy_file.py")
+shap_values <- read_npy_file("shap_values_500.npy")
+
+base_values <- read_npy_file("base_values_500.npy")
+
+X_500 = read.csv("lt_X_500.csv")
+
+feature_names = colnames(X_500)[-1]
+
+rm(X_500)
+
+y = read.csv("lt_y.csv")$x
+```
+
+
+```{r}
+ngenes = 300
+N = dim(shap_values)[1]
+nclass = dim(shap_values)[3]
+
+# top n genes per sample in each cluster
+# top_ngenes = apply(shap_values, 1, function(sample) {
+#   apply(sample, 2, function(class) {
+#     list(feature_names[order(abs(class), decreasing = TRUE)[1:N]])
+#   })
+# })
+# 
+# rm(top_ngenes)
+
+# top n genes per sample in their actual cluster
+top_ngenes_1Class = sapply(1:N, function(samp_ix) {
+    list(feature_names[order(abs(shap_values[samp_ix,,(y[samp_ix]+1)]), decreasing = TRUE)[1:ngenes]])
+})
+
+mean_shaps_PerClass = sapply(1:nclass, function(class_ix) {
+  mean_shaps = colMeans(shap_values[,,class_ix])
+})
+
+# top n genes per class
+top_ngenes_PerClass = sapply(1:nclass, function(class_ix) {
+  mean_shaps = mean_shaps_PerClass[,class_ix]
+  genes = feature_names[order(abs(mean_shaps), decreasing = TRUE)[1:ngenes]]
+  shaps = mean_shaps[order(abs(mean_shaps), decreasing = TRUE)[1:ngenes]]
+  df = list(as.data.frame(cbind(genes,shaps)))
+})
+
+```
+
+```{r}
+
+# Dimensionality reduction.
+# set.seed(1234)
+# sce <- runPCA(sce, ncomponents=40, subset_row=hvg)
+# # sce = runNMF(sce, ncomponents = 25, subset_row=hvg)
+# sce <- runUMAP(sce, dimred = 'PCA', external_neighbors=TRUE)
+
+sce <- logNormCounts(sce)
+
+# markers = findMarkers(sce, groups = y, direction = "up", lfc = 1.5, test="wilcox", pval.type = "some")
+
+# de = sapply(markers, function(marker) {
+#   marker[marker$FDR<0.01 & marker$summary.AUC > 0.6,]
+# })
+
+markers = findMarkers(sce, groups = y, lfc = 1)
+
+# Intersection per cluster between SHAP set and marker set
+sapply(1:nclass, function(cluster) {
+  cur.markers = markers[[cluster]]
+  length(intersect(rownames(cur.markers), top_ngenes_PerClass[[cluster]]$genes))
+})
+
+# Intersection per cluster between SHAP set and DE set (can define DE in different ways, but with similar results)
+sapply(1:nclass, function(cluster) {
+  cur.markers = markers[[cluster]]
+  best.set = cur.markers[cur.markers$Top <= 7,]
+  length(intersect(rownames(best.set), top_ngenes_PerClass[[cluster]]$genes))
+})
+```
+Looks like gene ranking by SHAP value and simply by marker status gives about the same results.
+
+So the genes are very likely to be included in the markers set, but quite unlikely to be in a 'differentially expressed' set, however defined (whether from Top or from AUC and FDR).
+
+Should also check for concordance or ranking differences between the two:
+
+```{r}
+# Difference in rankings per cluster between marker set and SHAP set
+sapply(1:nclass, function(cluster) {
+  genes = top_ngenes_PerClass[[cluster]]$genes
+  cur.markers = markers[[cluster]]
+  filt.markers = cur.markers[rownames(cur.markers) %in% genes,]
+  sapply(1:ngenes, function(x) {
+    idx = which(genes[x] == rownames(filt.markers))[1]
+    diff = x - idx
+})
+})
+
+```
+
+Furthermore, we can look at the actual intersecting genes between the marker set and the top-50 SHAP set, and compare their Top values, FDR/p-values and their SHAP values to compare contrast.
+
+```{r}
+# Per cluster gene list including SHAP value and marker data
+top_ngenes_PerClass = sapply(1:nclass, function(cluster) {
+  cur.markers = markers[[cluster]]
+  cur.markers = cur.markers[,1:3]
+  cur.markers$genes = rownames(cur.markers)
+  joined = dplyr::right_join(tibble::as_tibble(cur.markers), tibble::as_tibble(top_ngenes_PerClass[[cluster]]), by = "genes")
+  joined$shaps = as.numeric(joined$shaps)
+  list(joined[order(abs(joined$shaps), decreasing = TRUE),])
+})
+
+top_ngenes_PerClass[[3]]
+# Recall that now, genes are NOT in the same order as in feature_names!
+```
+
+It seems like they are agreeing that the top 5 or so genes are similarly important, but after that it is harder to tell. Could just be noise in the training as well.
+
+How do these differences in top genes (ranked by SHAP) and top DE genes change the gene ontology? What overlap is there in these two lists, beyond genes, but in actual ontology?
+
+
+### SHAP interactions
+
+Let's take a look at gene interactions now:
+
+```{r}
+interactions_PerClass <- read_npy_file("mean_interaction_perclass_500.npy")
+
+interactions_df_PerClass = sapply(1:nclass, function(class) {
+  inter = as.data.frame(interactions_PerClass[class,,])
+  rownames(inter) = feature_names
+  colnames(inter) = feature_names
+  list(inter)
+})
+
+interactions_df_PerClass[[1]]
+
+interaction_ratios = sapply(1:nclass, function(class) {
+  inter = interactions_df_PerClass[[class]]
+  sapply(1:length(feature_names), function(i) {
+    gene = feature_names[i]
+    main_effect = mean_shaps_PerClass[i,class]
+    off_diag = sum(abs(inter[i,]))
+    off_diag/main_effect
+  })
+})
+
+```
+
+Here are the interaction ratios per gene, in each class
+
+```{r}
+interaction_ratios[,2]
+```
+
+Now let's see if we can match up any of these interaction ratios with the intersection genes to see if interactions may be taking place with any of these genes:
+
+```{r}
+top_ngenes_PerClass = sapply(1:nclass, function(cluster) {
+  df = top_ngenes_PerClass[[cluster]]
+  interact = interaction_ratios[,cluster]
+  gene_idx = sapply(df$genes,match,feature_names)
+  df$interaction_ratio = interact[gene_idx]
+  
+  interact_df = interactions_df_PerClass[[cluster]]
+  df$interactions_list = sapply(df$genes, function(gene) {
+    gene_idx = match(gene, feature_names)
+    interaction_genes = feature_names[which(abs(interact_df[gene_idx,]) > 0)]
+    interaction_shaps = as.numeric(interact_df[which(abs(interact_df[gene_idx,]) > 0),gene_idx])
+    tib = tibble::as_tibble(cbind(interaction_genes,interaction_shaps))
+    tib$interaction_shaps = as.numeric(interaction_shaps)
+    list(tib)
+  })
+  df$interactionsGT0.01 = sapply(1:nrow(df), function(i) {
+    if(nrow(df$interactions_list[[i]]) > 0) {
+      any(abs(df$interactions_list[[i]]$interaction_shaps) > 1e-2)
+    } else {
+      FALSE
+    }
+  })
+  df$interactionsOutTopN = sapply(1:nrow(df), function(i) {
+    if(nrow(df$interactions_list[[i]]) > 0) {
+      any(!df$interactions_list[[i]]$interaction_genes %in% df$genes)
+    } else {
+      FALSE
+    }
+  })
+  list(df)
+})
+
+
+# Getting the SHAP interactions in class 1
+inter_df = interactions_df_PerClass[[2]]
+
+
+# Getting the top genes in class 1
+df = top_ngenes_PerClass[[2]]
+df
+
+# Getting the index of the top gene (by SHAP val) in class 1
+ix = match(df$genes[1], feature_names)
+
+# Getting the gene names for which the above top gene has a nonzero interaction
+feature_names[which(abs(inter_df[ix,]) > 0)]
+
+# Getting the SHAP interaction values for which the above top gene has a nonzero interaction
+inter_df[which(abs(inter_df[ix,]) > 0),ix]
+
+# Getting the interactions for the 7th top gene
+df$interactions_list$Gm10275
+
+sum(abs(inter_df[8,-8]))
+
+inter_df[8,8] / sum(abs(inter_df[8,-8]))
+
+interaction_ratios[match("Rplp1",feature_names),2]
+
+
+top_ngenes_PerClass[[5]]$interactions_list[[5]]
+
+top_ngenes_PerClass[[6]]$interactions_list[[4]]
+```
+
+Most of these genes don't show a lot of interaction effect (that is greater than 1e-2). The ones that we do see that pass that threshold seem to be self-interactions.
+
+### Gene Ontology
+
+Let's take a look at the genes in each cluster, where abs(SHAP) > 0.01 (this will be our threshold). We'll generate GO terms using `limma` and then compare the GO terms. We'll explore interactions factoring into this later.
+
+```{r}
+n_terms = 250
+GO_trad = sapply(1:nclass, function(chosen) {
+  cur.markers <- markers[[chosen]]
+  # is.de <- cur.markers$FDR <= 0.05
+  is.de = order(cur.markers$FDR, decreasing = T)[1:n_terms]
+
+  # goana() requires Entrez IDs, some of which map to multiple
+  # symbols - hence the unique() in the call below.
+  
+  # goana uses a hypergeometric test to check overrepresentation of certain markers,
+  # in comparison with biological processes in gene ontology
+  
+  library(org.Mm.eg.db)
+  entrez.ids <- mapIds(org.Mm.eg.db, keys=rownames(cur.markers), 
+      column="ENTREZID", keytype="SYMBOL")
+  
+  library(limma)
+  go.out <- goana(unique(entrez.ids[is.de]), species="Mm", 
+      universe=unique(entrez.ids))
+  
+  # Only keeping biological process terms that are not overly general, ie, biological processes
+  # that don't have too many members.
+  go.out <- go.out[order(go.out$P.DE),]
+  go.useful <- go.out[go.out$Ont=="BP" & go.out$N <= 200,]
+  list(go.useful)
+})
+
+GO_shap = sapply(1:nclass, function(chosen) {
+  cur.markers <- top_ngenes_PerClass[[chosen]]
+  # is.de <- abs(cur.markers$shaps) >= 0.01 
+  is.de = order(abs(cur.markers$shaps), decreasing = T)[1:n_terms]
+  
+  # goana() requires Entrez IDs, some of which map to multiple
+  # symbols - hence the unique() in the call below.
+  
+  # goana uses a hypergeometric test to check overrepresentation of certain markers,
+  # in comparison with biological processes in gene ontology
+  
+  library(org.Mm.eg.db)
+  entrez.ids <- mapIds(org.Mm.eg.db, keys=cur.markers$genes, 
+      column="ENTREZID", keytype="SYMBOL")
+  
+  library(limma)
+  go.out <- goana(unique(entrez.ids[is.de]), species="Mm", 
+      universe=unique(entrez.ids))
+  
+  # Only keeping biological process terms that are not overly general, ie, biological processes
+  # that don't have too many members.
+  go.out <- go.out[order(go.out$P.DE),]
+  go.useful <- go.out[go.out$Ont=="BP" & go.out$N <= 200,]
+  list(go.useful)
+})
+
+head(GO_shap[[1]], 20)
+
+rownames(GO_shap[[1]])
+
+intersect_GO = sapply(1:nclass, function(cluster) {
+  list(intersect(rownames(GO_shap[[cluster]]), rownames(GO_trad[[cluster]])))
+})
+
+sapply(1:nclass, function(cluster) {
+  2*length(intersect_GO[[cluster]]) / (length(rownames(GO_shap[[cluster]])) + length(rownames(GO_trad[[cluster]])))
+})
+```
+
+Pretty similar GO terms, it looks like. We selected the top `n_terms` genes from each cluster using FDR (trad) and SHAP values. Then we look at the overlap in GO terms - there seems to be a lot of overlap between the two, which makes sense. There may be more interesting 
+
+We'll take a brief look at the KEGG terms as well:
+
+```{r}
+n_terms = 250
+KEGG_trad = sapply(1:nclass, function(chosen) {
+  cur.markers <- markers[[chosen]]
+  # is.de <- cur.markers$FDR <= 0.05
+  is.de = order(cur.markers$FDR, decreasing = T)[1:n_terms]
+
+  # goana() requires Entrez IDs, some of which map to multiple
+  # symbols - hence the unique() in the call below.
+  
+  # goana uses a hypergeometric test to check overrepresentation of certain markers,
+  # in comparison with biological processes in gene ontology
+  
+  library(org.Mm.eg.db)
+  entrez.ids <- mapIds(org.Mm.eg.db, keys=rownames(cur.markers), 
+      column="ENTREZID", keytype="SYMBOL")
+  
+  library(limma)
+  kegg.out <- kegga(unique(entrez.ids[is.de]), species="Mm", 
+      universe=unique(entrez.ids))
+  
+  # Only keeping biological process terms that are not overly general, ie, biological processes
+  # that don't have too many members.
+  kegg.out <- kegg.out[order(kegg.out$P.DE),]
+  kegg.useful <- kegg.out[kegg.out$N <= 200,]
+  list(kegg.useful)
+})
+
+KEGG_shap = sapply(1:nclass, function(chosen) {
+  cur.markers <- top_ngenes_PerClass[[chosen]]
+  # is.de <- abs(cur.markers$shaps) >= 0.01 
+  is.de = order(abs(cur.markers$shaps), decreasing = T)[1:n_terms]
+  
+  # goana() requires Entrez IDs, some of which map to multiple
+  # symbols - hence the unique() in the call below.
+  
+  # goana uses a hypergeometric test to check overrepresentation of certain markers,
+  # in comparison with biological processes in gene ontology
+  
+  library(org.Mm.eg.db)
+  entrez.ids <- mapIds(org.Mm.eg.db, keys=cur.markers$genes, 
+      column="ENTREZID", keytype="SYMBOL")
+  
+  library(limma)
+  kegg.out <- kegga(unique(entrez.ids[is.de]), species="Mm", 
+      universe=unique(entrez.ids))
+  
+  # Only keeping biological process terms that are not overly general, ie, biological processes
+  # that don't have too many members.
+  kegg.out <- kegg.out[order(kegg.out$P.DE),]
+  kegg.useful <- kegg.out[kegg.out$N <= 200,]
+  list(kegg.useful)
+})
+
+head(KEGG_shap[[1]], 20)
+
+intersect_KEGG = sapply(1:nclass, function(cluster) {
+  list(intersect(rownames(KEGG_shap[[cluster]]), rownames(KEGG_trad[[cluster]])))
+})
+
+sapply(1:nclass, function(cluster) {
+  2*length(intersect_KEGG[[cluster]]) / (length(rownames(KEGG_shap[[cluster]])) + length(rownames(KEGG_trad[[cluster]])))
+})
+
+KEGG_trad[[1]]
+```
+
+KEGG keeps timing out, so I'm going to move on from here and assume there is likely decent overlap.
+
+### TODO stuff
+
+* Sanity check: do the interaction effects sum to the shap values?
+* Are these genes interacting with other genes in the top 50?
+* Do these gene interactions introduce new ontology terms (if outside of the top 50)?
+* How do these interaction terms change our conclusions based on main effects? Do we introduce any new pathways based on these interactions?
+* I need possibly a more sophisticated or general framework in which to explore interaction effects
+* Do the interaction effects change between clusters?
+* Google "shap interactions genetics" for more info (I could only find one paper)

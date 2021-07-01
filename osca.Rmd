@@ -1,0 +1,293 @@
+---
+title: "OSCA"
+author: "Joel Eliason"
+date: "8/25/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+options(repos = BiocManager::repositories())
+library(SingleCellExperiment)
+library(ensembldb)
+library(scRNAseq)
+library(AnnotationHub)
+library(scater)
+# renv::install("bioc::scran) to install Bioconductor packages
+# library(scran)
+```
+
+This notebook simply contains a lot of the code from the OSCA tutorial for single cell analysis. Copied here for reference and as a sandbox.
+
+### Quick start
+
+```{r}
+library(scRNAseq)
+sce <- MacoskoRetinaData()
+
+# Quality control.
+library(scater)
+is.mito <- grepl("^MT-", rownames(sce))
+qcstats <- perCellQCMetrics(sce, subsets=list(Mito=is.mito))
+filtered <- quickPerCellQC(qcstats, percent_subsets="subsets_Mito_percent")
+sce <- sce[, !filtered$discard]
+
+# Normalization.
+sce <- logNormCounts(sce)
+
+# Feature selection.
+library(scran)
+dec <- modelGeneVar(sce)
+hvg <- getTopHVGs(dec, prop=0.1)
+
+# Dimensionality reduction.
+set.seed(1234)
+sce <- runPCA(sce, ncomponents=25, subset_row=hvg)
+sce <- runUMAP(sce, dimred = 'PCA', external_neighbors=TRUE)
+
+# Clustering.
+g <- buildSNNGraph(sce, use.dimred = 'PCA')
+colLabels(sce) <- factor(igraph::cluster_louvain(g)$membership)
+
+# Visualization.
+plotUMAP(sce, colour_by="label")
+```
+
+### Quality Control
+
+```{r}
+sce.416b <- LunSpikeInData(which="416b") 
+sce.416b$block <- factor(sce.416b$block)
+```
+
+```{r}
+# Retrieving the mitochondrial transcripts using genomic locations included in
+# the row-level annotation for the SingleCellExperiment.
+location <- rowRanges(sce.416b)
+is.mito <- any(seqnames(location)=="MT")
+
+# ALTERNATIVELY: using resources in AnnotationHub to retrieve chromosomal
+# locations given the Ensembl IDs; this should yield the same result.
+ens.mm.v97 <- AnnotationHub()[["AH73905"]]
+chr.loc <- mapIds(ens.mm.v97, keys=rownames(sce.416b),
+    keytype="GENEID", column="SEQNAME")
+is.mito.alt <- which(chr.loc=="MT")
+
+df <- perCellQCMetrics(sce.416b, subsets=list(Mito=is.mito))
+df
+```
+
+```{r}
+sce.416b <- addPerCellQC(sce.416b, subsets=list(Mito=is.mito))
+colnames(colData(sce.416b))
+```
+
+```{r}
+# fixed threshold
+qc.lib <- df$sum < 1e5
+qc.nexprs <- df$detected < 5e3
+qc.spike <- df$altexps_ERCC_percent > 10
+qc.mito <- df$subsets_Mito_percent > 10
+discard <- qc.lib | qc.nexprs | qc.spike | qc.mito
+
+# Summarize the number of cells removed for each reason.
+DataFrame(LibSize=sum(qc.lib), NExprs=sum(qc.nexprs),
+    SpikeProp=sum(qc.spike), MitoProp=sum(qc.mito), Total=sum(discard))
+```
+
+```{r}
+# adaptive thresholding
+qc.lib2 <- isOutlier(df$sum, log=TRUE, type="lower")
+qc.nexprs2 <- isOutlier(df$detected, log=TRUE, type="lower")
+
+attr(qc.lib2, "thresholds")
+attr(qc.nexprs2, "thresholds")
+
+qc.spike2 <- isOutlier(df$altexps_ERCC_percent, type="higher")
+attr(qc.spike2, "thresholds")
+
+qc.mito2 <- isOutlier(df$subsets_Mito_percent, type="higher")
+attr(qc.mito2, "thresholds")
+
+discard2 <- qc.lib2 | qc.nexprs2 | qc.spike2 | qc.mito2
+
+# Summarize the number of cells removed for each reason.
+DataFrame(LibSize=sum(qc.lib2), NExprs=sum(qc.nexprs2),
+    SpikeProp=sum(qc.spike2), MitoProp=sum(qc.mito2), Total=sum(discard2))
+
+# can also do this with a convenience function, ie
+
+reasons <- quickPerCellQC(df, percent_subsets=c("subsets_Mito_percent",
+    "altexps_ERCC_percent"))
+colSums(as.matrix(reasons))
+```
+
+```{r}
+# batches of cells may have different experimental parameters, since batches will typically have different distributions of cells
+
+batch <- paste0(sce.416b$phenotype, "-", sce.416b$Plate)
+batch.reasons <- quickPerCellQC(df, percent_subsets=c("subsets_Mito_percent",
+    "altexps_ERCC_percent"), batch=batch)
+colSums(as.matrix(batch.reasons))
+```
+
+```{r}
+sce.grun <- GrunPancreasData()
+sce.grun <- addPerCellQC(sce.grun)
+
+# First attempt with batch-specific thresholds.
+discard.ercc <- isOutlier(sce.grun$altexps_ERCC_percent,
+    type="higher", batch=sce.grun$donor)
+with.blocking <- plotColData(sce.grun, x="donor", y="altexps_ERCC_percent",
+    colour_by=I(discard.ercc))
+
+# Second attempt, sharing information across batches
+# to avoid dramatically different thresholds for unusual batches.
+discard.ercc2 <- isOutlier(sce.grun$altexps_ERCC_percent,
+    type="higher", batch=sce.grun$donor,
+    subset=sce.grun$donor %in% c("D17", "D2", "D7"))
+without.blocking <- plotColData(sce.grun, x="donor", y="altexps_ERCC_percent",
+    colour_by=I(discard.ercc2))
+
+gridExtra::grid.arrange(with.blocking, without.blocking, ncol=2)
+```
+
+```{r}
+ercc.thresholds <- attr(discard.ercc, "thresholds")["higher",]
+ercc.thresholds
+
+names(ercc.thresholds)[isOutlier(ercc.thresholds, type="higher")]
+```
+
+```{r}
+colData(sce.416b) <- cbind(colData(sce.416b), df)
+sce.416b$block <- factor(sce.416b$block)
+sce.416b$phenotype <- ifelse(grepl("induced", sce.416b$phenotype),
+    "induced", "wild type")
+sce.416b$discard <- reasons$discard
+
+gridExtra::grid.arrange(
+    plotColData(sce.416b, x="block", y="sum", colour_by="discard",
+        other_fields="phenotype") + facet_wrap(~phenotype) + 
+        scale_y_log10() + ggtitle("Total count"),
+    plotColData(sce.416b, x="block", y="detected", colour_by="discard", 
+        other_fields="phenotype") + facet_wrap(~phenotype) + 
+        scale_y_log10() + ggtitle("Detected features"),
+    plotColData(sce.416b, x="block", y="subsets_Mito_percent", 
+        colour_by="discard", other_fields="phenotype") + 
+        facet_wrap(~phenotype) + ggtitle("Mito percent"),
+    plotColData(sce.416b, x="block", y="altexps_ERCC_percent", 
+        colour_by="discard", other_fields="phenotype") + 
+        facet_wrap(~phenotype) + ggtitle("ERCC percent"),
+    ncol=1
+)
+```
+
+### Normalization
+
+```{r}
+#--- loading ---#
+library(scRNAseq)
+sce.zeisel <- ZeiselBrainData()
+
+library(scater)
+sce.zeisel <- aggregateAcrossFeatures(sce.zeisel, 
+    id=sub("_loc[0-9]+$", "", rownames(sce.zeisel)))
+
+#--- gene-annotation ---#
+library(org.Mm.eg.db)
+rowData(sce.zeisel)$Ensembl <- mapIds(org.Mm.eg.db, 
+    keys=rownames(sce.zeisel), keytype="SYMBOL", column="ENSEMBL")
+
+#--- quality-control ---#
+stats <- perCellQCMetrics(sce.zeisel, subsets=list(
+    Mt=rowData(sce.zeisel)$featureType=="mito"))
+qc <- quickPerCellQC(stats, percent_subsets=c("altexps_ERCC_percent", 
+    "subsets_Mt_percent"))
+sce.zeisel <- sce.zeisel[,!qc$discard]
+```
+
+```{r}
+library(scater)
+lib.sf.zeisel <- librarySizeFactors(sce.zeisel)
+summary(lib.sf.zeisel)
+
+hist(log10(lib.sf.zeisel), xlab="Log10[Size factor]", col='grey80')
+
+```
+
+#### Normalization by deconvolution
+
+This method attempts to remove biases introduced by differential expression. These biases come about because differentially expressed genes cause non-DE to appear to be DE (upregulated genes cause non-DE genes to appear to be downregulated). To fix this, group cells according to expression profile. Then calculate size factor for each group with reference to some "average" cell. Then deconvolve these group size factors to cell size factors. This helps avoid problems from low- and zero-count genes.
+
+```{r}
+library(scran)
+set.seed(100)
+clust.zeisel <- quickCluster(sce.zeisel) # quick clustering based on graph or hierarchical clustering
+table(clust.zeisel)
+
+deconv.sf.zeisel <- calculateSumFactors(sce.zeisel, cluster=clust.zeisel)
+summary(deconv.sf.zeisel)
+```
+
+```{r}
+plot(lib.sf.zeisel, deconv.sf.zeisel, xlab="Library size factor",
+    ylab="Deconvolution size factor", log='xy', pch=16,
+    col=as.integer(factor(sce.zeisel$level1class)))
+abline(a=0, b=1, col="red")
+```
+
+We see that the deconvolution size factors exhibit cell type-specific deviations from the library size factors in the above figure. This is consistent with the presence of composition biases that are introduced by strong differential expression between cell types. Use of the deconvolution size factors adjusts for these biases to improve normalization accuracy for downstream applications.
+
+Can also use spike-in normalization (under assumption spike-in amount is constant, use this as a reference point).
+
+```{r}
+set.seed(100)
+clust.zeisel <- quickCluster(sce.zeisel) 
+sce.zeisel <- computeSumFactors(sce.zeisel, cluster=clust.zeisel, min.mean=0.1)
+sce.zeisel <- logNormCounts(sce.zeisel)
+assayNames(sce.zeisel)
+```
+
+### FEATURE SELECTION
+
+```{r}
+#--- loading ---#
+library(BiocFileCache)
+bfc <- BiocFileCache("raw_data", ask = FALSE)
+raw.path <- bfcrpath(bfc, file.path("http://cf.10xgenomics.com/samples",
+    "cell-exp/2.1.0/pbmc4k/pbmc4k_raw_gene_bc_matrices.tar.gz"))
+untar(raw.path, exdir=file.path(tempdir(), "pbmc4k"))
+
+library(DropletUtils)
+fname <- file.path(tempdir(), "pbmc4k/raw_gene_bc_matrices/GRCh38")
+sce.pbmc <- read10xCounts(fname, col.names=TRUE)
+
+#--- gene-annotation ---#
+library(scater)
+rownames(sce.pbmc) <- uniquifyFeatureNames(
+    rowData(sce.pbmc)$ID, rowData(sce.pbmc)$Symbol)
+
+library(EnsDb.Hsapiens.v86)
+location <- mapIds(EnsDb.Hsapiens.v86, keys=rowData(sce.pbmc)$ID, 
+    column="SEQNAME", keytype="GENEID")
+
+#--- cell-detection ---#
+set.seed(100)
+e.out <- emptyDrops(counts(sce.pbmc))
+sce.pbmc <- sce.pbmc[,which(e.out$FDR <= 0.001)]
+
+#--- quality-control ---#
+stats <- perCellQCMetrics(sce.pbmc, subsets=list(Mito=which(location=="MT")))
+high.mito <- isOutlier(stats$subsets_Mito_percent, type="higher")
+sce.pbmc <- sce.pbmc[,!high.mito]
+
+#--- normalization ---#
+library(scran)
+set.seed(1000)
+clusters <- quickCluster(sce.pbmc)
+sce.pbmc <- computeSumFactors(sce.pbmc, cluster=clusters)
+sce.pbmc <- logNormCounts(sce.pbmc)
+```
+

@@ -1,0 +1,472 @@
+---
+title: "Lung cancer timecourse analysis"
+author: "Joel Eliason"
+date: "5/8/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(R.matlab)
+library(SingleCellExperiment)
+library(scater)
+library(scran)
+```
+
+In this notebook, I attempt to replicate some of the claims made in the paper "Emergence of a High-Plasticity Cell State
+during Lung Cancer Evolution" by Marjanovic et al.
+
+I also go further into trajectory analysis of single-cell RNA seq.
+```{r, cache=T}
+# d = read.csv('/media/joeleliason/Data/lung_timecourse/SCP971/expression/normTPM_formatted.csv', row.names = 1)
+#
+# read_mat <- function(file, ram = TRUE){
+#   file <- normalizePath(file, mustWork = TRUE)
+#   # Check if the file is HDF5 format
+#   tryCatch(
+#     {
+#     f <- rhdf5::H5Fopen(file)
+#     dset_names <- rhdf5::h5ls(f)
+#     re <- sapply(dset_names, function(nm){
+#       r <- rhdf5::h5read(file, name = nm)
+#       if(ram){
+#         r <- r[]
+#       }
+#       r
+#     }, simplify = FALSE, USE.NAMES = TRUE)
+#     
+#     re
+#     },
+#     finally={
+#       rhdf5::h5closeAll()
+#     }
+#   )
+# }
+# 
+# read_mat <- function(file, ram = TRUE){
+#   file <- normalizePath(file, mustWork = TRUE)
+#   # Check if the file is HDF5 format
+#   if( hdf5r::is_hdf5(file) ){
+# 
+#     f <- hdf5r::H5File$new(filename = file, mode = 'r')
+#     on.exit(f$close())
+#     dset_names <- hdf5r::list.datasets(f)
+#     re <- sapply(dset_names, function(nm){
+#       r <- load_h5(file, name = nm)
+#       if(ram){
+#         r <- r[]
+#       }
+#       r
+#     }, simplify = FALSE, USE.NAMES = TRUE)
+# 
+#   }else{
+#     re <- R.matlab::readMat(file)
+#   }
+#   re
+# }
+# 
+# path = '/media/joeleliason/Data/lung_timecourse/SCP971/other/ltraw.mat'
+# 
+# r = readMat(path)
+# 
+# counts = r$rawCount
+# 
+# colnames(counts) = unlist(r$sampleID, recursive = FALSE)
+# rownames(counts) = unlist(r$geneSymbol, recursive = FALSE)
+# 
+# # counts = counts[,-grep('_4w_',colnames(counts))]
+# sce = SingleCellExperiment(assays = list(counts = counts))
+# 
+# sce$typeID = do.call(c, unlist(r$typeID, recursive=FALSE))
+# 
+# spl = strsplit(sce$typeID,'_')
+# weeks = sapply(spl, function(x) x[3])
+# sce$weeks = weeks
+# 
+# # sce$geneID = do.call(c, unlist(r$geneID, recursive=FALSE))
+# 
+# rm(r,counts)
+# 
+# sce = devianceFeatureSelection(sce, assay="counts", sorted = TRUE, batch = as.factor(sce$typeID))
+# saveRDS(sce, "lung_timecourse/SCP971_sce.rds")
+
+sce = readRDS("SCP971_sce.rds")
+
+```
+
+Normalization followed by selection of top variable genes using the deviance
+```{r}
+# Normalization.
+sce <- logNormCounts(sce)
+
+# Feature selection.
+geneVar <- modelGeneVar(sce, density.weights = F)
+# Visualizing the fit:
+fit <- metadata(geneVar)
+plot(fit$mean, fit$var, xlab="Mean of log-expression",
+    ylab="Variance of log-expression")
+curve(fit$trend(x), col="dodgerblue", add=TRUE, lwd=2)
+
+# hvg <- getTopHVGs(geneVar, n=2000) # revisit this - for now going to use the deviance to select top genes
+
+# sce = sce[1:2000,]
+
+hvg = rownames(sce)[1:2000]
+
+```
+
+```{r}
+# Dimensionality reduction.
+set.seed(1234)
+sce <- runPCA(sce, ncomponents=40, subset_row=hvg)
+# sce = runNMF(sce, ncomponents = 25, subset_row=hvg)
+sce <- runUMAP(sce, dimred = 'PCA', external_neighbors=TRUE)
+
+```
+
+```{r}
+# Clustering.
+
+library(bluster)
+
+plotApproxSilhouette = function(sce, clust) {
+
+  # Performing the calculations on the PC coordinates, like before.
+  sil.approx <- approxSilhouette(reducedDim(sce, "PCA"), clusters=clust)
+  
+  sil.data <- as.data.frame(sil.approx)
+  sil.data$closest <- factor(ifelse(sil.data$width > 0, clust, sil.data$other))
+  sil.data$cluster <- factor(clust)
+  
+  ggplot(sil.data, aes(x=cluster, y=width, colour=closest)) + 
+    ggbeeswarm::geom_quasirandom(method="smiley")
+}
+
+```
+
+
+Clustering of cells. `bluster` has a nice clustering interface, where we can input params as `HclustParam`, `KmeansParam` or `NNGraphParam` but keep the same API. Note that `reducedDim(sce, "PCA")` returns a matrix where cells are rows and columns are principal components.
+
+```{r}
+clust <- clusterRows(reducedDim(sce, "PCA"), NNGraphParam(cluster.fun = 'louvain', k = 15))
+plotApproxSilhouette(sce, clust)
+
+sce$label = clust
+```
+
+Can visualize UMAP results, and color them by the clustering label we just found. Can also cluster by their typeID, which 
+```{r}
+# Visualization.
+plotUMAP(sce, colour_by="label")
+
+plotUMAP(sce, colour_by="typeID")
+```
+
+```{r}
+nclust = length(levels(clust))
+
+wk = c('_0w_','_2w_','_4w_','_12w_','_18w_','_20w_','_30w_')
+
+# Getting indices of cells in each week cluster
+cells_by_week = sapply(wk, function(w) {
+  grep(w, colnames(sce))
+})
+
+sapply(cells_by_week, length)
+
+# Getting the clusters present in each week (based on the cell indices in each week found above)
+clust_by_week = sapply(wk, function(n) {
+  unique(clust[cells_by_week[[n]]])
+})
+
+clust_by_week
+
+cells_by_week
+
+```
+
+Claim that cells from later weeks inhabit a larger number of clusters is somewhat supported.
+
+
+## DE Genes
+
+```{r}
+markers = findMarkers(sce, direction = "up", lfc = 1.5, test="wilcox", pval.type = "some")
+
+# List of dataframes of DE genes per cluster
+de = sapply(markers, function(marker) {
+  marker[marker$FDR<0.01 & marker$summary.AUC > 0.6,]
+})
+
+de
+```
+
+
+```{r}
+tab = table(sce$label, sce$typeID) # 2-way table, showing number of cells in each type and cluster combination
+t = chisq.test(tab, simulate.p.value = T) # Performing a chisq.test of the null hypothesis that cluster label and type are independent - that is, that the joint distribution is the product of the row and column marginals.
+
+
+library(pheatmap)
+# chisq.test also returns the standardized Pearson residuals, which we can plot to see where the null hypothesis of independence is most violated - that is, where cluster label and type are more correlated than expected.
+pheatmap(t$stdres, cluster_rows = F, cluster_cols = F, angle_col = 45, display_numbers = T)
+
+
+```
+
+Here we can see that cluster 11 is overrepresented in the `early` cohort, and cluster 12 has high representation at 20 weeks. We could possibly use these clusters as proxies for these cohorts. Our clustering algorithm seems to have found some interesting distinctions between the K and KP types.
+
+For example, cluster 8 shows that the K 30 week cohort has some similarity with the KP 18 week cohort. We can also see that within the KP 12 week cohort, we have two clusters that are overrepresented, 1 and 5.
+
+```{r}
+# assay(sce, "logcounts")
+# 
+# logs = assay(sce,"logcounts")
+# 
+# rmeans = rowMeans(logs)
+# rsdev = sqrt(rowVars(logs))
+# 
+# (logs - rmeans) / rsdev
+# zscore = apply(logs,2,function(x) {
+#   (x - mean(x)) / sd(x)
+# })
+# 
+# logs = assay(sce, "logcounts")
+# logs = logs[,order(clust)]
+# clust[order(clust)]
+# pheatmap(logs,show_rownames = F, show_colnames = F)
+```
+
+## Cell type annotation
+
+```{r}
+# Defunct
+#
+# ref <- celldex::MouseRNAseqData()
+# ref
+
+# load('/media/joeleliason/Data/lung_timecourse/13089323', verbose = T)
+# 
+# tiss = UpdateSeuratObject(tiss)
+# ref = as.SingleCellExperiment(tiss)
+# 
+# ref = ref[,!is.na(ref$cell_ontology_class)]
+```
+
+```{r}
+# Operational
+
+# lung1 = read.table('/media/joeleliason/Data/lung_timecourse/rmbatch_dge/Lung1_rm.batch_dge.txt', header = T)
+# lung2 = read.table('/media/joeleliason/Data/lung_timecourse/rmbatch_dge/Lung2_rm.batch_dge.txt', header = T)
+# lung3 = read.table('/media/joeleliason/Data/lung_timecourse/rmbatch_dge/Lung3_rm.batch_dge.txt', header = T)
+# 
+# common_genes = intersect(intersect(rownames(lung1), rownames(lung2)), rownames(lung3))
+# 
+# lung1 = lung1[common_genes,]
+# lung2 = lung2[common_genes,]
+# lung3 = lung3[common_genes,]
+# 
+# lung_counts = do.call(cbind,c(lung1,lung2,lung3))
+# 
+# rownames(lung_counts) = common_genes
+# 
+# lung_ref = SingleCellExperiment(assays = list(counts = lung_counts))
+# 
+# raw_annot = read.csv('/media/joeleliason/Data/lung_timecourse/MCA_CellAssignments.csv')
+# 
+# lung_names = raw_annot[raw_annot$Tissue == 'Lung',]$Cell.name
+# 
+# # intersect(lung_names,colnames(lung_ref))
+# # lung_ref = lung_ref[,colnames(lung_ref) %in% raw_annot$Cell.name]
+# 
+# lung_ref = lung_ref[,lung_names]
+# 
+# colLabels(lung_ref) = raw_annot[raw_annot$Cell.name %in% lung_names,]$Annotation
+# 
+# lung_ref = logNormCounts(lung_ref)
+# 
+# saveRDS(lung_ref, "lung_ref.rds")
+```
+
+```{r}
+lung_ref = readRDS("lung_ref.rds")
+```
+
+Based on the reference set from above, we are going to predict the cell types of our dataset.
+
+```{r}
+library(SingleR)
+pred <- SingleR(test=sce, ref=lung_ref, labels=lung_ref$label) # need common (?) labels for genes
+# label.fine vs label.main
+table(pred$labels)
+```
+
+This function doesn't seem to be working.
+```{r}
+plotScoreHeatmap(pred)
+```
+
+We are again going to do a heatmap, but this time of cluster label against cell type annotation. We can
+```{r}
+tab <- table(Cluster=sce$label, Assigned=pred$pruned.labels)
+
+# Adding a pseudo-count of 10 to avoid strong color jumps with just 1 cell.
+pheatmap(log2(tab+10), cluster_rows = F, cluster_cols = F, angle_col = 45, color=colorRampPalette(c("white", "blue"))(101))
+```
+
+We can also similarly do a residual analysis after performing a chisq. test:
+
+```{r}
+t = chisq.test(tab, simulate.p.value = T)
+
+pheatmap(t$stdres, cluster_rows = F, cluster_cols = F, angle_col = 45, display_numbers = T)
+```
+
+
+```{r}
+library(vcd)
+
+mosaicplot(tab)
+```
+
+Need to work on formatting this one.
+
+
+### Cell cycle annotation
+
+Here we are going to follow the OSCA book in looking at cell cycle annotations across clusters and typeIDs.
+
+```{r}
+cyclin.genes <- grep("^Ccn[abde][0-9]$", rowData(sce)$SYMBOL)
+cyclin.genes <- rownames(sce)[cyclin.genes]
+cyclin.genes
+```
+
+Unfortunately, it looks like we can't do cell cycle annotation, since none of the cyclins seem to be in the measured genes.
+
+To note in the future: "...this is merely a symptom of a more fundamental issue - that the cell cycle is not independent of the other processes that are occurring in a cell. This will be a recurring theme throughout the chapter, which suggests that cell cycle inferences are best used in comparisons between closely related cell types where there are fewer changes elsewhere that might interfere with interpretation." (OSCA, Chapter 17)
+
+### Trajectory analysis
+
+"The big question is how to identify the trajectory from high-dimensional expression data and map individual cells onto it. A massive variety of different algorithms are available for doing so..."
+
+Here we will start with the minimum spanning tree. The MST is an undirected acylic graph that passes through the centroid of each cluster exactly once - hence is the most parsimonious structure for connecting clusters.
+
+We obtain the aggregated cells, the centroids of those clusters and then create the MST.
+
+```{r}
+by.cluster <- aggregateAcrossCells(sce, ids=colLabels(sce))
+centroids <- reducedDim(by.cluster, "PCA")
+
+# Set clusters=NULL as we have already aggregated above.
+library(TSCAN)
+mst <- createClusterMST(centroids, clusters=NULL)
+mst
+```
+We then get the edges of the graph and project them onto UMAP space, along with the colored clusters.
+
+```{r}
+line.data <- reportEdges(by.cluster, mst=mst, clusters=NULL, use.dimred="UMAP")
+
+plotUMAP(sce, colour_by="label") + 
+    geom_line(data=line.data, mapping=aes(x=dim1, y=dim2, group=edge))
+```
+
+We can then get the pseudotime ordering after picking on of the endpoint nodes as the root (maybe by picking the endpoint as a cell type that is more pluripotent).
+
+```{r}
+map.tscan <- mapCellsToEdges(sce, mst=mst, use.dimred="PCA")
+tscan.pseudo <- orderCells(map.tscan, mst)
+head(tscan.pseudo)
+```
+Each row in `tscan.pseudo` represents a cell, and each column is an individual path branching through the MST, with the column number indicating the end cluster of that path (can identify paths this way since the MST is acyclic - every branching event leads to a different node). Furthermore, the value in the matrix is the pseudotime, or distance from the root node along that particular path. NAs indicate that the cell is not on that particular path (a cell is on a path if the path goes through that cell's cluster). Note that pseudotimes are the same across all paths (per cell), since if a cell is on multiple paths, those paths must branch at or after that cluster, so the distance to the root node will be the same.
+
+```{r}
+common.pseudo <- rowMeans(tscan.pseudo, na.rm=TRUE)
+plotUMAP(sce, colour_by=I(common.pseudo), 
+        text_by="label", text_colour="red") +
+    geom_line(data=line.data, mapping=aes(x=dim1, y=dim2, group=edge))
+```
+
+Can also just do (goes from `aggregateAcrossCells` to `orderCells`):
+
+```{r}
+pseudo.all <- quickPseudotime(sce, use.dimred="PCA")
+head(pseudo.all$ordering)
+```
+
+We can also enforce outgroups, where a cluster is made to stand out from the rest of the MST:
+
+```{r}
+pseudo.og <- quickPseudotime(sce, use.dimred="PCA", outgroup=TRUE)
+set.seed(10101)
+plot(pseudo.og$mst)
+```
+
+"If the clusters are not sufficiently granular, it is possible for TSCAN to overlook variation that occurs inside a single cluster. The MST is obliged to pass through each cluster exactly once, which can lead to excessively circuitous paths in overclustered datasets as well as the formation of irrelevant paths between distinct cell subpopulations if the outgroup threshold is too high. The MST also fails to handle more complex events such as “bubbles” (i.e., a bifurcation and then a merging) or cycles." (OSCA)
+
+Need to look further into this outgroups thing.
+
+#### Principal Curves
+
+We'll next take a look at principal curves (nonlinear generalization of PCA, axes can bend), another method for forming pseudotime trajectories.
+
+First, we'll look at one principal curve through our cells:
+
+```{r}
+library(slingshot)
+sce.sling <- slingshot(sce, reducedDim='PCA')
+head(sce.sling$slingPseudotime_1)
+```
+
+```{r}
+embedded <- embedCurves(sce.sling, "UMAP")
+embedded <- slingCurves(embedded)[[1]] # only 1 path.
+embedded <- data.frame(embedded$s[embedded$ord,])
+
+plotUMAP(sce.sling, colour_by="slingPseudotime_1") +
+    geom_path(data=embedded, aes(x=Dim.1, y=Dim.2), size=1.2)
+```
+
+We can also look at multiple paths through the dataset, using the MST as a rough scaffolding.
+
+```{r}
+sce.sling2 <- slingshot(sce, cluster=colLabels(sce), reducedDim='PCA', approx_points = 100)
+pseudo.paths <- slingPseudotime(sce.sling2)
+head(pseudo.paths)
+
+shared.pseudo <- rowMeans(pseudo.paths, na.rm=TRUE)
+
+# Need to loop over the paths and add each one separately.
+gg <- plotUMAP(sce.sling2, colour_by=I(shared.pseudo))
+embedded <- embedCurves(sce.sling2, "UMAP")
+embedded <- slingCurves(embedded)
+for (path in embedded) {
+    embedded <- data.frame(path$s[path$ord,])
+    gg <- gg + geom_path(data=embedded, aes(x=Dim.1, y=Dim.2), size=1.2)
+}
+
+gg
+```
+
+We can also look at the number of cells belonging to each curve or subset of curves:
+
+```{r}
+curve.assignments <- slingBranchID(sce.sling2)
+table(curve.assignments)
+```
+
+#### Characterizing trajectories
+
+```{r}
+pseudo <- testPseudotime(sce, pseudotime=tscan.pseudo[,1])
+pseudo[order(pseudo$p.value),]
+sorted <- pseudo[order(pseudo$p.value),]
+sorted
+
+up.left <- sorted[sorted$logFC < 0,]
+head(up.left, 10)
+```
+
+`testPseudotime` will fit a spline for each gene wrt pseudotime (by ordering cells in pseudotime) and then tests if the coefficients are significant per gene by calculating a p-value and FDR. Also it is helpful to then calculate a linear model on these genes in order to get an interpretable coefficient.
+
