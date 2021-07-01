@@ -205,7 +205,7 @@ Should also check for concordance or ranking differences between the two:
 
 ```{r}
 # Difference in rankings per cluster between marker set and SHAP set
-sapply(1:nclass, function(cluster) {
+diff_rank = sapply(1:nclass, function(cluster) {
   genes = top_ngenes_PerClass[[cluster]]$genes
   cur.markers = markers[[cluster]]
   filt.markers = cur.markers[rownames(cur.markers) %in% genes,]
@@ -215,6 +215,7 @@ sapply(1:nclass, function(cluster) {
 })
 })
 
+head(diff_rank)
 ```
 
 Furthermore, we can look at the actual intersecting genes between the marker set and the top-50 SHAP set, and compare their Top values, FDR/p-values and their SHAP values to compare contrast.
@@ -253,8 +254,6 @@ interactions_df_PerClass = sapply(1:nclass, function(class) {
   list(inter)
 })
 
-interactions_df_PerClass[[1]]
-
 interaction_ratios = sapply(1:nclass, function(class) {
   inter = interactions_df_PerClass[[class]]
   sapply(1:length(feature_names), function(i) {
@@ -270,7 +269,7 @@ interaction_ratios = sapply(1:nclass, function(class) {
 Here are the interaction ratios per gene, in each class
 
 ```{r}
-interaction_ratios[,2]
+head(interaction_ratios[,2])
 ```
 
 Now let's see if we can match up any of these interaction ratios with the intersection genes to see if interactions may be taking place with any of these genes:
@@ -403,8 +402,6 @@ GO_shap = sapply(1:nclass, function(chosen) {
 
 head(GO_shap[[1]], 20)
 
-rownames(GO_shap[[1]])
-
 intersect_GO = sapply(1:nclass, function(cluster) {
   list(intersect(rownames(GO_shap[[cluster]]), rownames(GO_trad[[cluster]])))
 })
@@ -418,7 +415,7 @@ Pretty similar GO terms, it looks like. We selected the top `n_terms` genes from
 
 We'll take a brief look at the KEGG terms as well:
 
-```{r}
+```{r, include=FALSE}
 n_terms = 250
 KEGG_trad = sapply(1:nclass, function(chosen) {
   cur.markers <- markers[[chosen]]
