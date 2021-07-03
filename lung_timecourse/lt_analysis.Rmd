@@ -181,8 +181,6 @@ clust_by_week = sapply(wk, function(n) {
 
 clust_by_week
 
-cells_by_week
-
 ```
 
 Claim that cells from later weeks inhabit a larger number of clusters is somewhat supported.
@@ -198,7 +196,6 @@ de = sapply(markers, function(marker) {
   marker[marker$FDR<0.01 & marker$summary.AUC > 0.6,]
 })
 
-de
 ```
 
 
@@ -413,7 +410,7 @@ We'll next take a look at principal curves (nonlinear generalization of PCA, axe
 
 First, we'll look at one principal curve through our cells:
 
-```{r}
+```{r,cache=TRUE}
 library(slingshot)
 sce.sling <- slingshot(sce, reducedDim='PCA')
 head(sce.sling$slingPseudotime_1)
@@ -430,7 +427,7 @@ plotUMAP(sce.sling, colour_by="slingPseudotime_1") +
 
 We can also look at multiple paths through the dataset, using the MST as a rough scaffolding.
 
-```{r}
+```{r,cache=TRUE}
 sce.sling2 <- slingshot(sce, cluster=colLabels(sce), reducedDim='PCA', approx_points = 100)
 pseudo.paths <- slingPseudotime(sce.sling2)
 head(pseudo.paths)
@@ -468,5 +465,108 @@ up.left <- sorted[sorted$logFC < 0,]
 head(up.left, 10)
 ```
 
-`testPseudotime` will fit a spline for each gene wrt pseudotime (by ordering cells in pseudotime) and then tests if the coefficients are significant per gene by calculating a p-value and FDR. Also it is helpful to then calculate a linear model on these genes in order to get an interpretable coefficient.
+`testPseudotime` will fit a spline for each gene wrt pseudotime (by ordering cells in pseudotime) and then tests if the coefficients are significant per gene by calculating a p-value and FDR. Also it is helpful to then calculate a linear model on these genes in order to get an interpretable coefficient. We also get an estimate of log FC back, which gives us an estimate of that logFC on that path.
 
+```{r}
+# Making a copy of our SCE and including the pseudotimes in the colData.
+sce2 <- sce
+sce2$TSCAN.first <- tscan.pseudo[,1]
+sce2$TSCAN.second <- tscan.pseudo[,2]
+sce2$TSCAN.third <- tscan.pseudo[,3]
+sce2$TSCAN.fourth <- tscan.pseudo[,4]
+
+
+# Discarding the offending cluster.
+# discard <- "7"
+# keep <- colLabels(sce.nest)!=discard
+# sce.nest2 <- sce.nest2[,keep]
+
+# Testing against the first path again.
+pseudo <- testPseudotime(sce2, pseudotime=sce2$TSCAN.first)
+rowData(sce2)$SYMBOL = rownames(sce2)
+pseudo$SYMBOL <- rownames(sce2)
+sorted <- pseudo[order(pseudo$p.value),]
+
+up.left <- sorted[sorted$logFC < 0,]
+head(up.left, 10)
+
+best <- head(up.left$SYMBOL, 6)
+plotExpression(sce2, features=best, swap_rownames="SYMBOL",
+    x="TSCAN.first", colour_by="label")
+```
+
+Here we can see the cells that are upregulated on the left in pseudotime and become more and more downregulated fairly far to the right on the trajectory. Using `topGO` to ascertain what these ontologies are related to:
+
+```{r}
+is.de <- head(up.left$SYMBOL, 200)
+library(org.Hs.eg.db)
+entrez.ids <- mapIds(org.Hs.eg.db, keys=rownames(sce2), 
+    column="ENTREZID", keytype="SYMBOL")
+
+library(limma)
+go.out <- goana(unique(entrez.ids[is.de]), species="Hs", 
+    universe=unique(entrez.ids))
+
+
+go.out <- go.out[order(go.out$P.DE),]
+go.useful <- go.out[go.out$Ont=="BP" & go.out$N <= 200,]
+
+head(go.useful, 20)
+```
+
+We can see some regulation of cell death being downregulated, as well as downregulation of cell proliferation, regulation of interleukin-8 and cytokine response. Makes sense for cancerous cells.
+
+We can also check out up-regulated genes:
+
+```{r}
+up.right <- sorted[sorted$logFC > 0,]
+head(up.right, 10)
+
+best <- head(up.right$SYMBOL, 6)
+plotExpression(sce2, features=best, swap_rownames="SYMBOL",
+    x="TSCAN.first", colour_by="label")
+```
+
+The upregulation definitely seems more prominent here than the down-regulation did.
+
+Again, let's look at GO terms:
+
+```{r}
+is.de <- head(up.right$SYMBOL, 200)
+library(org.Hs.eg.db)
+entrez.ids <- mapIds(org.Hs.eg.db, keys=rownames(sce2), 
+    column="ENTREZID", keytype="SYMBOL")
+
+library(limma)
+go.out <- goana(unique(entrez.ids[is.de]), species="Hs", 
+    universe=unique(entrez.ids))
+
+
+go.out <- go.out[order(go.out$P.DE),]
+go.useful <- go.out[go.out$Ont=="BP" & go.out$N <= 200,]
+
+head(go.useful, 20)
+```
+
+Interesting. Some kind of vague terms here. Lots of "processes". We can at least see the representation of more metabolism related terms here, which is definitely interesting.
+
+We can put the up-regulated info on a heatmap as well:
+
+```{r}
+on.first.path <- !is.na(sce2$TSCAN.first)
+plotHeatmap(sce2[,on.first.path], order_columns_by="TSCAN.first", 
+    colour_columns_by="label", features=head(up.right$SYMBOL, 50),
+    center=TRUE, swap_rownames="SYMBOL")
+```
+
+Only right at the end of the trajectory do we get any differentiation. I wonder if that is typical for lung cancers.
+
+Let's now look at rooting the trajectory. In this case, we are lucky, as we have actual time points, so we know trajectories evolving over pseudotime are actually also evolving over time as well.
+
+```{r}
+sce2 <- slingshot(sce2, reducedDim="PCA")
+plot(factor(sce2$weeks, levels = c("early","2w","12w","18w","20w","30w")), sce2$slingPseudotime_1, 
+    xlab="Time", ylab="Pseudotime")
+```
+
+Interesting. So this seems like some evidence that the cells evolved along the trajectory (in pseudotime) and then traveled back along the trajectory. Maybe back towards a highly plastic cell state?
